@@ -1,0 +1,31 @@
+max_dl: 1
+
+target_url:
+  - http://www.youtube.com/news
+  - http://www.youtube.com/sports
+  - http://www.youtube.com/videos?s=mp
+  - http://www.youtube.com/results?search_type=videos&search_query=%E3%81%AD%E3%81%93&search_sort=video_date_uploaded&suggested_categories=15&uni=3
+
+parse_regexp:
+  - watch\?v=(\S+?)["&].*?\salt="([^"]+?)"
+  - watch\?v=(\S+?)["&].*?\stitle="([^"]+?)"
+
+ng_keywords:
+  - ここに空白くぎりで NG-WORDを 書いておくと
+  - タイトルにヒット したビデオは DLしません
+
+youtube_dl_path: ./youtube-dl.sh
+youtube_dl_option: --no-overwrites
+youtube_dl_url: http://youtube.com/watch?v=
+lock_expire: 3600
+lock_path: ./.lock_autoyoutube
+log_encoding: euc-jp
+extensions: mp4 flv
+#enable_debug_stor: 1
+
+enable_export_video: 0
+export_batch_file: auto-youtube-rename-for-NTFS.bat
+export_batch_encoding: cp932
+export_shell:
+  - mv -- -*.flv -*.mp4 /mnt/windows/youtube/ > /dev/null 2>&1
+  - mv *.bat *.flv *.mp4 /mnt/windows/youtube/ > /dev/null 2>&1

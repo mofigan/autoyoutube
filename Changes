@@ -1,0 +1,11 @@
+== 0.2.3 (2010/07/29) ==
+
+ * Rename option: --update to --download.
+
+== 0.2.2 (2010/06/29) ==
+
+ * Fixed ng_keywords bugs.
+
+== 0.2.1 (2010/06/28) ==
+
+ * First release

@@ -1,0 +1,459 @@
+#!/usr/bin/perl
+our $VERSION = '0.2.3';
+
+############################################################
+package AutoYoutubeDat;
+use strict;
+use warnings;
+use Carp;
+use Encode;
+
+sub new {
+    my $class = shift;
+    my $self = bless {
+        stor => {},
+        @_ ,
+    }, $class;
+    return $self;
+}
+
+sub update {
+    my $self = shift;
+    $self->load;
+    $self->crawler;
+    $self->dl;
+    $self->move;
+    $self->save;
+}
+
+sub move {
+    my $self = shift;
+    my $myname = AutoYoutube->context->{myname};
+    my $conf = AutoYoutube->context->{conf};
+    return if (not $conf->{enable_export_video});
+
+    my @bat;
+    push @bat, '@echo off';
+    foreach my $id (keys %{$self->{stor}}) {
+	if (defined $self->{stor}->{$id}) {
+	    my $file = $self->{stor}->{$id}->{isdownload};
+	    next if (not defined $file);
+	    next if ($file =~ /^\d+$/); # error video
+	    my $tit = $self->{stor}->{$id}->{title};
+	    $tit =~ tr|[\\\/\:\*\"\?<>]|-|;    # for NTFS
+	    my $sjis = encode($conf->{export_batch_encoding},
+			      decode('utf8', $tit));
+	    $sjis =~ s/\?//g;
+	    push @bat, qq|if exist "$file" move "$file" "$sjis $file"|;
+	}
+    }
+    open my $out, ">". $conf->{export_batch_file};
+    foreach (@bat) { print $out "$_\r\n"; }
+    close $out;
+    foreach my $sys (@{$conf->{export_shell}}) {
+	system $sys;
+    }
+}
+
+sub dl {
+    my $self = shift;
+    my $myname = AutoYoutube->context->{myname};
+    my $conf =  AutoYoutube->context->{conf};
+    my $max_dl = $conf->{max_dl} || 1;
+    return if not -f $conf->{youtube_dl_path};
+    my $nvideo = 0;
+    foreach my $id (keys %{$self->{stor}}) {
+        if (not defined $self->{stor}->{$id}->{isdownload}) {
+            my $u = $conf->{youtube_dl_url}. $id;
+            my $t = $self->{stor}->{$id}->{title};
+
+            my $ng;
+            foreach my $keyline (@{$conf->{ng_keywords}}) {
+		foreach my $keyword (split /\s+/, $keyline) {
+		    if ($t =~ m/\Q$keyword\E/) {
+			$ng = $keyword;
+			last;
+		    }
+		}
+		last if ($ng);
+            }
+            if ($ng) {
+                AutoYoutube->context->log("NG: skip: $ng: $t");
+                $self->{stor}->{$id}->{isdownload} = '999'; # NG's code
+                next;
+            }
+
+            my $sys = $conf->{youtube_dl_path};
+            $sys .= ' ' . $conf->{youtube_dl_option};
+            $sys .= ' ' . $u;
+            my $rv = system $sys;
+            if ($rv) {
+                carp "autoyoutube: Error: rv=$rv: $!";
+                system "rm -f -- $id*";
+		# Set error code.
+		# rv=256: blocked it on copyright grounds.
+		#         removed by the user.
+                $self->{stor}->{$id}->{isdownload} = $rv;
+            }
+            else {
+                # Success!
+                AutoYoutube->context->log("rv=$rv");
+                my $file;
+                foreach my $ext (split /\s+/, $conf->{extensions}) {
+                    $file = "$id.$ext" if -f "$id.$ext";
+                }
+                $self->{stor}->{$id}->{isdownload} = $file if $file;
+            }
+            $nvideo++;
+            last if ($nvideo >= $max_dl);
+        }
+    }
+}
+
+sub crawler {
+    my $self = shift;
+    my $myname = AutoYoutube->context->{myname};
+    my $conf = AutoYoutube->context->{conf};
+    my $html = "$myname.dat.html";
+    foreach my $url (@{$conf->{target_url}}) {
+        unlink $html;
+        AutoYoutube->context->log("GET $url");
+        my $rv = _httpget($url, $html);
+        carp "$!" if $rv !~ /^200/;
+        AutoYoutube->context->log($rv);
+        sleep(1); # pending
+        $self->set($html);
+        unlink $html;
+    }
+}
+
+sub set {
+    my $self = shift;
+    my ($infile) = @_;
+    my $nhit = 0;
+    my $nset = 0;
+    my $siz = -s $infile;
+    my $conf = AutoYoutube->context->{conf};
+    AutoYoutube->context->log("infile=$infile ($siz bytes)");
+    open my $in, $infile or croak "$infile: $!";
+    while (<$in>) {
+        chomp;
+	foreach my $regexp (@{$conf->{parse_regexp}}) {
+	    if (m/$regexp/) {
+		my ($id, $alt) = ($1, $2);
+		$nhit++;
+		if (not defined $self->{stor}->{$id}) {
+		    $self->{stor}->{$id}->{title} = $alt;
+		    $self->{stor}->{$id}->{epoch} = time;
+		    $nset++;
+		    last;
+		}
+	    }
+	}
+    }
+    close $in;
+    AutoYoutube->context->log("RegexpHit=$nhit NewHit=$nset");
+}
+
+sub load {
+    my $self = shift;
+    $self->{stor} = _hashload(AutoYoutube->context->{myname} . ".dat.stor");
+}
+
+sub save {
+    my $self = shift;
+    _hashsave(AutoYoutube->context->{myname} .".dat.stor",
+	      $self->{stor},
+	      AutoYoutube->context->{enable_debug_stor});
+}
+
+sub _hashload {
+    my ($filename) = @_;
+    return if (not -f $filename);
+    my $hashref;
+    eval { $hashref = retrieve($filename); };
+    croak $! if ($@);
+    return $hashref;
+}
+
+sub _hashsave {
+    my ($filename, $ref, $opt_debug) = @_;
+    my $hash_ref = \%{$ref};
+    use Storable;
+    store $hash_ref, $filename;
+    if ($opt_debug) {
+        use Data::Dumper;
+        local $Data::Dumper::Indent = 1;
+        local $Data::Dumper::Sortkeys = 1;
+        local $Data::Dumper::Terse = 1;
+        open my $out, ">$filename.txt";
+        print $out Dumper($ref);
+        close $out;
+    }
+}
+
+sub _hashexpire {
+    my ($ref) = @_;
+}
+
+sub _httpget {
+    my ($uri, $file) = @_;
+    use LWP::UserAgent;
+    open my $wfh, '>', $file or croak "$file:$!";
+    binmode $wfh;
+    my $res = LWP::UserAgent->new->get($uri,
+        ':content_cb' => sub {
+            my ($chunk, $res, $proto) = @_;
+            print $wfh $chunk;
+        });
+    close $wfh;
+    return $res->status_line;
+}
+
+sub _get_content {
+    my ($file) = @_;
+    open my $in, '<', $file or croak "$file: $!";
+    my $content = do { local $/; <$in> };
+    close $in;
+    return $content;
+}
+
+1;
+
+############################################################
+package AutoYoutube;
+use strict;
+use warnings;
+use Encode;
+use Carp;
+use Data::Dumper;
+use YAML::Syck;
+use File::Spec;
+
+my $context;
+sub context { $context }
+sub set_context { $context = $_[1] }
+
+sub new {
+    my $class = shift;
+    my $self = bless {
+        myname => 'autoyoutube',
+        conf => {},
+        @_ ,
+    }, $class;
+    AutoYoutube->set_context($self);
+    return $self;
+}
+
+sub boot {
+    my $self = shift;
+    my ($opt) = @_;
+    $self->load($opt->{config});
+    if (not -f $self->{conf}->{youtube_dl_path}) {
+	croak $self->{conf}->{youtube_dl_path} . " is not found. See also http://bitbucket.org/rg3/youtube-dl/wiki/";
+    }
+    my $dir = $self->{conf}->{lock_path};
+    if ($self->begin_lock($dir)) {
+        AutoYoutubeDat->new->update if $opt->{download};
+    }
+    $self->end_lock($dir);
+}
+
+sub begin_lock {
+    my ($self, $lock) = @_;
+    if (-d $lock) {
+        my $mtime = (stat($lock))[9];
+        if (time - $mtime < AutoYoutube->context->{conf}->{lock_expire}) {
+            warn "Locked: $lock\n";
+            return 0;
+        }
+        warn "Expire: $lock\n";
+        rmdir $lock;
+    }
+    return mkdir($lock, 0755) ? 1 : 0;
+}
+
+sub end_lock {
+    my ($self, $lock) = @_;
+    rmdir $lock;
+}
+
+sub load {
+    my ($self, $file) = @_;
+    my ($vol, $dir, $filename) = File::Spec->splitpath($file);
+    $self->log("load: $filename");
+    eval { $self->{conf} = LoadFile($file); };
+    croak "$file: $!" if ($@);
+}
+
+sub dumper_data {
+    my ($self, $item) = @_;
+    local $Data::Dumper::Indent = 1;
+    local $Data::Dumper::Sortkeys = 1;
+    local $Data::Dumper::Terse = 1;
+    return Dumper($item);
+}
+
+sub dumper {
+    my ($self, $item) = @_;
+    $self->log($self->dumper_data($item));
+}
+
+sub log {
+    my ($self, $msg) = @_;
+    my $ymd= localtime;
+    chomp($msg);
+    my $encoding = $self->{connf}->{log_encoding} || 'euc-jp';
+    if ($encoding) {
+        $msg = Encode::decode_utf8($msg) unless utf8::is_utf8($msg);
+        $msg = Encode::encode($encoding, $msg);
+    }
+    warn "$ymd [$$] $msg\n";
+}
+
+1;
+
+############################################################
+package main;
+use strict;
+use Getopt::Long;
+use FindBin;
+use File::Spec;
+
+my %opt;
+$opt{config} = File::Spec->catfile($FindBin::Bin, 'autoyoutube.yaml');
+GetOptions('config=s' => \$opt{config},
+           'version' => \my $version,
+           'download!', \$opt{download});
+if ($version) {
+    print "version $VERSION\n";
+    exit;
+}
+
+my $ay = AutoYoutube->new;
+$ay->log("begin.");
+$ay->boot(\%opt);
+$ay->log("end.");
+
+__END__
+
+############################################################
+=encoding utf-8
+
+=head1 NAME
+
+autoyoutube - youtube-dlを使ったYouTubeダウンローダー
+
+=head1 SYNOPSYS
+
+  $ autoyoutube [--config file] [--update] [--version]
+
+=head1 DESCRIPTION
+
+autoyoutubeはYouTubeダウンローダーです。内部でyoutube-dlを呼
+び出します。任意のURLからビデオIDとタイトルを抜きだして、ビデ
+オファイルをダウンロードします。NGワードやビデオファイルの移
+動などをサポートしています。
+
+=head2 Require
+
+  Perl 5.8.1 or higher and several CPAN modules
+  youtube-dl 2010.07.24 or higher
+  L<http://bitbucket.org/rg3/youtube-dl/wiki/>
+
+=head2 Install
+
+autoyoutube.yamlを作成します。
+
+  $ cp autoyoutube.yaml.sample autoyoutube.yaml
+
+autoyoutube.yamlを修正します。
+
+  $ (Edit autoyoutube.yaml)
+
+ダウンロードします。
+
+  $ ./autoyoutube --download
+
+ビデオがダウンロードされないとき、youtube-dl --updateで最新版
+に更新すると成功する場合があります。
+
+=head2 Commandline option
+
+--config file 設定ファイルを読み込みます
+
+--version バージョンを表示して終了します
+
+--download 設定ファイルにしたがってビデオをダウンロードします
+
+=head2 Yaml
+
+=head3 max_dl
+
+指定した数のビデオをダウンロードしたのち終了します。デフォル
+トは1です。
+
+=head3 target_url
+
+YouTubeのリンクが含まれるURLを指定します。複数行可。
+
+=head3 parse_regexp
+
+target_urlで指定したURLのHTMLを解析する際に使う正規表現です。
+IDおよびタイトルを括弧で抜き出す必要があります。複数行可。最
+初にヒットした正規表現が使われます。
+
+=head3 ng_keywords
+
+ここに指定されたキーワードがタイトルに含まれるビデオはダウン
+ロードしません。複数行可。キーワードは空白区切り。正規表現は
+使えません。
+
+=head3 youtube_dl_path
+
+youtube_dlへのパス。必須。
+
+=head3 enable_export_video
+
+1ならダウンロード後にビデオファイルを移動します。もし0ならば
+「export_」ではじまるオプションはすべて無効になります。ファイ
+ルの移動はexport_shellのとおりに行われます。環境に応じて適切
+に設定してください。
+
+=head3 export_batch_file
+
+enable_export_videoが有効のとき、バッチファイルが出力されます。
+「VideoID.flv」を「ビデオタイトル VideoID.flv」にリネームする
+ためのバッチファイル名です。youtube-dlでダウンロードされたファ
+イルはファイル名がIDというわかりにくいものですが、このバッチ
+ファイルとビデオファイルをWindows系のOSに移動したのち、バッチ
+を実行すると、何のビデオかわかりやすくなります。
+
+=head3 export_batch_encoding
+
+enable_export_videoが有効のときのexport_batch_fileの漢字コー
+ド。通常、cp932のままで変更の必要はありません。
+
+=head3 export_shell
+
+enable_export_videoが有効のとき、ここに指定されたコマンドがビ
+デオダウンロード後に実行されます。
+
+=head1 AUTHOR
+
+mofigan <mofigan@gmail.com>
+
+=head1 SEE ALSO
+
+L<http://mofigan.posterous.com/>
+
+=head1 LICENCE
+
+autoyoutubeはフリーソフトウェアです。特に言及される場合を除き、
+Perlと同じ条件において再配布および修正が可能です。
+
+Except where otherwise noted, goopos is free software; you
+can redistribute it and/or modify it under the same terms as
+Perl itself.
+
+=cut
